@@ -47,7 +47,7 @@ def generate_index_copy_kernel(
 ) -> IndentedBuffer:
     # Decorators
     code.writeline("@libentry()")
-    code.writeline("@triton.jit(debug=True)")
+    code.writeline("@triton.jit")
 
     # Signature
     code.writeline(f"def {kernel_name}(")
