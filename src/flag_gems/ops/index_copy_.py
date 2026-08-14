@@ -68,9 +68,7 @@ def generate_index_copy_kernel(
             )
             code.writeline(f"{stride_args}, # stride for src")
 
-            shape_args = ", ".join(
-                f"src_shape_{i}: tl.constexpr" for i in range(rank)
-            )
+            shape_args = ", ".join(f"src_shape_{i}: tl.constexpr" for i in range(rank))
             code.writeline(f"{shape_args}, # shape for src")
 
             code.writeline("BLOCK_SIZE: tl.constexpr,")
@@ -104,7 +102,7 @@ def generate_index_copy_kernel(
                 "valid_index = (src_dim_idx >= 0) & (src_dim_idx < inp_shape_dim)"
             )
             code.writeline(
-                'tl.device_assert((~mask) | valid_index, '
+                "tl.device_assert((~mask) | valid_index, "
                 '"index value out of bounds: 0 <= index < self.size(dim)")'
             )
 
