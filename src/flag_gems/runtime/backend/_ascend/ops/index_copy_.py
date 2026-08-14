@@ -131,73 +131,50 @@ def index_copy_ascend_flat_kernel(
         mask=store_mask,
     )
 
-@libentry()
-@triton.jit(
-    do_not_specialize=[
-        "outer_size",
-        "input_dim",
-        "index_len",
-    ]
-)
-def index_copy_ascend_inner1_kernel(
+
+@triton.jit
+def index_copy_ascend_large_1d_kernel(
     out_ptr,
     src_ptr,
     index_ptr,
-    outer_size,
     input_dim,
     index_len,
-    BLOCK_OUTER: tl.constexpr,
-    BLOCK_INDEX: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    ELEMENTS_PER_PROGRAM: tl.constexpr,
 ):
-    outer_offsets = (
-        tle.program_id(axis=0) * BLOCK_OUTER
-        + tl.arange(0, BLOCK_OUTER)[:, None]
-    )
+    pid = tl.program_id(0).to(tl.int64)
+    program_start = pid * ELEMENTS_PER_PROGRAM
+    offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
 
-    index_offsets = (
-        tle.program_id(axis=1) * BLOCK_INDEX
-        + tl.arange(0, BLOCK_INDEX)[None, :]
-    )
-    outer_offsets_i64 = outer_offsets.to(tl.int64)
-    index_offsets_i64 = index_offsets.to(tl.int64)
+    for block_start in tl.range(
+        0,
+        ELEMENTS_PER_PROGRAM,
+        BLOCK_SIZE,
+    ):
+        src_offsets = program_start + block_start + offsets
+        src_mask = src_offsets < index_len
 
-    outer_mask = outer_offsets < outer_size
-    index_mask = index_offsets < index_len
+        dst_offsets = tl.load(
+            index_ptr + src_offsets,
+            mask=src_mask,
+            other=0,
+        ).to(tl.int64)
 
-    dst_index = tl.load(
-        index_ptr + index_offsets_i64,
-        mask=index_mask,
-        other=0,
-    )
+        valid_index = (
+            (dst_offsets >= 0)
+            & (dst_offsets < input_dim)
+        )
+        mask = src_mask & valid_index
 
-    src_offsets = (
-        outer_offsets_i64 * index_len
-        + index_offsets_i64
-    )
-
-    dst_offsets = (
-        outer_offsets_i64 * input_dim
-        + dst_index
-    )
-
-    #valid_index = (
-    #    (dst_index >= 0)
-    #    & (dst_index < input_dim)
-    #)
-
-    #mask = outer_mask & index_mask & valid_index
-
-    value = tl.load(
-        src_ptr + src_offsets,
-        mask=mask,
-        other=0.0,
-    )
-
-    tl.store(
-        out_ptr + dst_offsets,
-        value,
-        mask=mask,
-    )
+        values = tl.load(
+            src_ptr + src_offsets,
+            mask=src_mask,
+        )
+        tl.store(
+            out_ptr + dst_offsets,
+            values,
+            mask=mask,
+        )
 
 @libentry()
 @triton.jit(
@@ -269,6 +246,7 @@ def index_copy_ascend_row_kernel(
         mask=mask,
     )
 
+
 def _select_tile(inner_size):
     if inner_size == 1:
         return 128, 1
@@ -294,20 +272,16 @@ def _select_row_block_size(inner_size):
         return 256
     return 1024
 
-def _select_inner1_tile(outer_size, index_len):
-    if index_len <= 32:
-        return 16, 32
-
-    if index_len <= 64:
-        return 16, 64
-
-    return 8, 128
-
-
 def _launch_index_copy(out, dim, index, src):
-    index_len = index.numel()
-    inner_size = math.prod(out.shape[dim + 1 :])
+    #index_len = index.numel()
+    #inner_size = math.prod(out.shape[dim + 1 :])
+    #outer_size = math.prod(out.shape[:dim])
+    dim = dim % out.ndim
+
     outer_size = math.prod(out.shape[:dim])
+    dim_size = out.shape[dim]
+    inner_size = math.prod(out.shape[dim + 1 :])
+    index_len = index.numel()
 
     if index_len == 0 or inner_size == 0:
         return
@@ -316,19 +290,26 @@ def _launch_index_copy(out, dim, index, src):
     numel = outer_size * index_len * inner_size
 
     with torch_device_fn.device(out.device):
-        if inner_size <= 4:
-            block_size = _select_flat_block_size(numel, inner_size)
-            grid = (triton.cdiv(numel, block_size),)
+        if (
+            out.ndim == 1
+            and dim == 0
+            and inner_size == 1
+            and numel >= _LARGE_1D_THRESHOLD
+        ):
+            block_size = _LARGE_1D_BLOCK_SIZE
+            elements_per_program = _LARGE_1D_ELEMENTS_PER_PROGRAM
+            grid = (
+                triton.cdiv(index_len, elements_per_program),
+            )
 
-            index_copy_ascend_flat_kernel[grid](
+            index_copy_ascend_large_1d_kernel[grid](
                 out,
                 src,
                 index,
                 input_dim,
                 index_len,
-                inner_size,
-                numel,
                 BLOCK_SIZE=block_size,
+                ELEMENTS_PER_PROGRAM=elements_per_program,
             )
         else:
             row_count = outer_size * index_len
