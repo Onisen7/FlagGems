@@ -1,7 +1,20 @@
+# Copyright 2026 FlagOS Contributors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import logging
 import math
 
-import torch
 import triton
 import triton.language as tl
 
@@ -11,67 +24,6 @@ from flag_gems.utils import triton_lang_extension as tle
 
 logger = logging.getLogger(__name__)
 
-
-@libentry()
-@triton.jit(
-    do_not_specialize=[
-        "input_dim",
-        "index_len",
-        "inner_size",
-        "num_index_blocks",
-    ]
-)
-def index_copy_ascend_kernel(
-    out_ptr,
-    src_ptr,
-    index_ptr,
-    input_dim,
-    index_len,
-    inner_size,
-    num_index_blocks,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    pid_m = tle.program_id(axis=0)
-    pid_n = tle.program_id(axis=1)
-
-    outer_id = pid_m // num_index_blocks
-    index_block = pid_m - outer_id * num_index_blocks
-
-    index_offset = (
-        index_block * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
-    )
-    inner_offset = (
-        pid_n * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
-    )
-
-    index_mask = index_offset < index_len
-    dst_index = tl.load(
-        index_ptr + index_offset,
-        mask=index_mask,
-        other=0,
-    )
-
-    # Ascend 当前不支持带 mask 的 tl.device_assert。
-    # 这里先保证越界索引不会造成非法写内存。
-    valid_index = (dst_index >= 0) & (dst_index < input_dim)
-    mask = (
-        index_mask
-        & (inner_offset < inner_size)
-        & valid_index
-    )
-
-    src_offset = (
-        (outer_id * index_len + index_offset) * inner_size
-        + inner_offset
-    )
-    dst_offset = (
-        (outer_id * input_dim + dst_index) * inner_size
-        + inner_offset
-    )
-
-    value = tl.load(src_ptr + src_offset, mask=mask, other=0.0)
-    tl.store(out_ptr + dst_offset, value, mask=mask)
 
 @libentry()
 @triton.jit(
@@ -92,12 +44,8 @@ def index_copy_ascend_flat_kernel(
     numel,
     BLOCK_SIZE: tl.constexpr,
 ):
-    offsets = (
-        tle.program_id(axis=0) * BLOCK_SIZE
-        + tl.arange(0, BLOCK_SIZE)
-    )
+    offsets = tle.program_id(axis=0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < numel
-
     offsets_i64 = offsets.to(tl.int64)
 
     inner_offset = offsets_i64 % inner_size
@@ -105,99 +53,15 @@ def index_copy_ascend_flat_kernel(
     index_offset = src_row % index_len
     outer_offset = src_row // index_len
 
-    dst_index = tl.load(
-        index_ptr + index_offset,
-        mask=mask,
-        other=0,
-    )
-
+    dst_index = tl.load(index_ptr + index_offset, mask=mask, other=0)
     valid_index = (dst_index >= 0) & (dst_index < input_dim)
-    store_mask = mask & valid_index
 
-    value = tl.load(
-        src_ptr + offsets_i64,
-        mask=mask,
-        other=0.0,
-    )
+    value = tl.load(src_ptr + offsets_i64, mask=mask, other=0.0)
+    dst_offset = (outer_offset * input_dim + dst_index) * inner_size + inner_offset
 
-    dst_offset = (
-        (outer_offset * input_dim + dst_index) * inner_size
-        + inner_offset
-    )
+    # Triton Ascend does not support the mask argument of tl.device_assert.
+    tl.store(out_ptr + dst_offset, value, mask=mask & valid_index)
 
-    tl.store(
-        out_ptr + dst_offset,
-        value,
-        mask=store_mask,
-    )
-
-@libentry()
-@triton.jit(
-    do_not_specialize=[
-        "outer_size",
-        "input_dim",
-        "index_len",
-    ]
-)
-def index_copy_ascend_inner1_kernel(
-    out_ptr,
-    src_ptr,
-    index_ptr,
-    outer_size,
-    input_dim,
-    index_len,
-    BLOCK_OUTER: tl.constexpr,
-    BLOCK_INDEX: tl.constexpr,
-):
-    outer_offsets = (
-        tle.program_id(axis=0) * BLOCK_OUTER
-        + tl.arange(0, BLOCK_OUTER)[:, None]
-    )
-
-    index_offsets = (
-        tle.program_id(axis=1) * BLOCK_INDEX
-        + tl.arange(0, BLOCK_INDEX)[None, :]
-    )
-    outer_offsets_i64 = outer_offsets.to(tl.int64)
-    index_offsets_i64 = index_offsets.to(tl.int64)
-
-    outer_mask = outer_offsets < outer_size
-    index_mask = index_offsets < index_len
-
-    dst_index = tl.load(
-        index_ptr + index_offsets_i64,
-        mask=index_mask,
-        other=0,
-    )
-
-    src_offsets = (
-        outer_offsets_i64 * index_len
-        + index_offsets_i64
-    )
-
-    dst_offsets = (
-        outer_offsets_i64 * input_dim
-        + dst_index
-    )
-
-    #valid_index = (
-    #    (dst_index >= 0)
-    #    & (dst_index < input_dim)
-    #)
-
-    #mask = outer_mask & index_mask & valid_index
-
-    value = tl.load(
-        src_ptr + src_offsets,
-        mask=mask,
-        other=0.0,
-    )
-
-    tl.store(
-        out_ptr + dst_offsets,
-        value,
-        mask=mask,
-    )
 
 @libentry()
 @triton.jit(
@@ -221,10 +85,7 @@ def index_copy_ascend_row_kernel(
     row_id = tle.program_id(axis=0)
     row_id_i64 = row_id.to(tl.int64)
 
-    inner_offsets = (
-        tle.program_id(axis=1) * BLOCK_SIZE
-        + tl.arange(0, BLOCK_SIZE)
-    )
+    inner_offsets = tle.program_id(axis=1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     inner_offsets_i64 = inner_offsets.to(tl.int64)
 
     row_mask = row_id < row_count
@@ -233,75 +94,23 @@ def index_copy_ascend_row_kernel(
     index_offset = row_id_i64 % index_len
     outer_offset = row_id_i64 // index_len
 
-    dst_index = tl.load(
-        index_ptr + index_offset,
-        mask=row_mask,
-        other=0,
-    )
-
-    valid_index = (
-        (dst_index >= 0)
-        & (dst_index < input_dim)
-    )
-
+    dst_index = tl.load(index_ptr + index_offset, mask=row_mask, other=0)
+    valid_index = (dst_index >= 0) & (dst_index < input_dim)
     mask = row_mask & inner_mask & valid_index
 
-    src_offsets = (
-        row_id_i64 * inner_size
-        + inner_offsets_i64
-    )
-
+    src_offsets = row_id_i64 * inner_size + inner_offsets_i64
     dst_offsets = (
-        (outer_offset * input_dim + dst_index)
-        * inner_size
-        + inner_offsets
-    )
+        outer_offset * input_dim + dst_index
+    ) * inner_size + inner_offsets_i64
 
-    value = tl.load(
-        src_ptr + src_offsets,
-        mask=mask,
-        other=0.0,
-    )
+    value = tl.load(src_ptr + src_offsets, mask=mask, other=0.0)
+    tl.store(out_ptr + dst_offsets, value, mask=mask)
 
-    tl.store(
-        out_ptr + dst_offsets,
-        value,
-        mask=mask,
-    )
 
-def _select_tile(inner_size):
-    if inner_size == 1:
-        return 128, 1
-    if inner_size <= 4:
-        return 64, 4
-    if inner_size <= 64:
-        return 16, 64
-    return 8, 128
-    
 def _select_flat_block_size(numel, inner_size):
-    if inner_size == 1:
-        if numel <= 4096:
-            return 256
-        return 1024
-
-
-    return 1024
-
-def _select_row_block_size(inner_size):
-    if inner_size <= 128:
-        return 128
-    if inner_size <= 512:
+    if inner_size == 1 and numel <= 4096:
         return 256
     return 1024
-
-def _select_inner1_tile(outer_size, index_len):
-    if index_len <= 32:
-        return 16, 32
-
-    if index_len <= 64:
-        return 16, 64
-
-    return 8, 128
 
 
 def _launch_index_copy(out, dim, index, src):
@@ -319,7 +128,6 @@ def _launch_index_copy(out, dim, index, src):
         if inner_size <= 4:
             block_size = _select_flat_block_size(numel, inner_size)
             grid = (triton.cdiv(numel, block_size),)
-
             index_copy_ascend_flat_kernel[grid](
                 out,
                 src,
@@ -330,29 +138,26 @@ def _launch_index_copy(out, dim, index, src):
                 numel,
                 BLOCK_SIZE=block_size,
             )
-        else:
-            row_count = outer_size * index_len
-            block_size = 256
-            grid = (
-                row_count,
-                triton.cdiv(inner_size, block_size),
-            )
+            return
 
-            index_copy_ascend_row_kernel[grid](
-                out,
-                src,
-                index,
-                input_dim,
-                index_len,
-                inner_size,
-                row_count,
-                BLOCK_SIZE=block_size,
-            )
-      
+        row_count = outer_size * index_len
+        block_size = 256
+        grid = (row_count, triton.cdiv(inner_size, block_size))
+        index_copy_ascend_row_kernel[grid](
+            out,
+            src,
+            index,
+            input_dim,
+            index_len,
+            inner_size,
+            row_count,
+            BLOCK_SIZE=block_size,
+        )
+
 
 def index_copy(inp, dim, index, src):
     logger.debug("GEMS ASCEND INDEX_COPY")
-    dim = dim % inp.ndim
+    dim %= inp.ndim
     out = inp.clone()
     _launch_index_copy(out, dim, index, src)
     return out
@@ -360,6 +165,6 @@ def index_copy(inp, dim, index, src):
 
 def index_copy_(inp, dim, index, src):
     logger.debug("GEMS ASCEND INDEX_COPY_")
-    dim = dim % inp.ndim
+    dim %= inp.ndim
     _launch_index_copy(inp, dim, index, src)
     return inp
