@@ -30,36 +30,60 @@ class RreluWithNoiseBenchmark(base.UnaryPointwiseBenchmark):
     def get_input_iter(self, dtype: torch.dtype) -> Generator:
         for shape in self.shapes:
             inp = utils.generate_tensor_input(shape, dtype, self.device)
-            noise = torch.empty_like(inp)
-            yield inp, noise, DEFAULT_LOWER, DEFAULT_UPPER, True, None
+            noise = torch.zeros_like(inp)
+            yield inp, noise, DEFAULT_LOWER, DEFAULT_UPPER, self.training, None
 
 
 class RreluWithNoiseInplaceBenchmark(base.UnaryPointwiseBenchmark):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._snapshot_key = None
+        self._snapshot = None
+
+    def get_latency(self, op, *args, **kwargs):
+        # Benchmark.run measures the reference implementation first and then
+        # FlagGems with the same positional tensors. Restore both mutable
+        # buffers before the second measurement so the two implementations
+        # start from the same distribution. The shared benchmark base still
+        # repeats the callable on that buffer during warmup/repetition.
+        if len(args) >= 2 and torch.is_tensor(args[0]) and torch.is_tensor(args[1]):
+            key = (tuple(args[0].shape), args[0].dtype, args[0].device)
+            if self._snapshot_key == key:
+                args[0].copy_(self._snapshot[0])
+                args[1].copy_(self._snapshot[1])
+            else:
+                self._snapshot_key = key
+                self._snapshot = (args[0].clone(), args[1].clone())
+        return super().get_latency(op, *args, **kwargs)
+
     def get_input_iter(self, dtype: torch.dtype) -> Generator:
         for shape in self.shapes:
             inp = utils.generate_tensor_input(shape, dtype, self.device)
-            noise = torch.empty_like(inp)
-            # The benchmark framework reuses positional arguments for repeated
-            # calls. Both implementations therefore observe the same mutated
-            # in-place buffer, without charging the benchmark for a reset copy.
-            yield inp, noise, DEFAULT_LOWER, DEFAULT_UPPER, True, None
+            noise = torch.zeros_like(inp)
+            yield inp, noise, DEFAULT_LOWER, DEFAULT_UPPER, self.training, None
 
 
 @pytest.mark.rrelu_with_noise
-def test_rrelu_with_noise():
+@pytest.mark.parametrize("training", [False, True])
+def test_rrelu_with_noise(training):
     bench = RreluWithNoiseBenchmark(
         op_name="rrelu_with_noise",
         torch_op=torch.ops.aten.rrelu_with_noise,
         dtypes=consts.FLOAT_DTYPES,
+        is_inplace=False,
     )
+    bench.training = training
     bench.run()
 
 
 @pytest.mark.rrelu_with_noise_
-def test_rrelu_with_noise_inplace():
+@pytest.mark.parametrize("training", [False, True])
+def test_rrelu_with_noise_inplace(training):
     bench = RreluWithNoiseInplaceBenchmark(
         op_name="rrelu_with_noise_",
         torch_op=torch.ops.aten.rrelu_with_noise_,
         dtypes=consts.FLOAT_DTYPES,
+        is_inplace=True,
     )
+    bench.training = training
     bench.run()

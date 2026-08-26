@@ -29,14 +29,28 @@ DEFAULT_UPPER = 0.3333333333333333
 
 @pointwise_dynamic(
     is_tensor=[True, True],
+    num_outputs=2,
+    promotion_methods=[(0, 1, "DEFAULT"), (0, 1, "DEFAULT")],
+)
+@triton.jit
+def _rrelu_with_noise_train(self, noise):
+    # ATen samples for self <= 0 (including signed zero), and records one for
+    # positive/NaN elements. Keeping this predicate aligned with backward is
+    # important because noise is the training-time gradient multiplier.
+    not_positive = self <= 0
+    effective_noise = tl.where(not_positive, noise, 1.0)
+    output = tl.where(not_positive, self * effective_noise, self)
+    return output, effective_noise
+
+
+@pointwise_dynamic(
+    is_tensor=[True, False],
     num_outputs=1,
     promotion_methods=[(0, 1, "DEFAULT")],
 )
 @triton.jit
-def _rrelu_with_noise_forward(self, noise):
-    # The noise tensor contains the per-element slope for the non-positive
-    # branch. Positive elements are copied unchanged.
-    return tl.where(self > 0, self, self * noise)
+def _rrelu_with_noise_eval(self, slope):
+    return tl.where(self > 0, self, self * slope)
 
 
 def _check_rrelu_with_noise_args(self, noise, lower, upper, generator):
@@ -73,12 +87,11 @@ def _check_rrelu_with_noise_args(self, noise, lower, upper, generator):
         raise AssertionError("generator is not supported in FlagGems")
 
 
-def _fill_training_noise(self, noise, lower, upper):
-    # The ATen operator writes the sampled slope into the caller-provided
-    # noise buffer. FlagGems currently uses the default device RNG only.
-    sampled = torch.rand_like(self) * (float(upper) - float(lower)) + float(lower)
-    effective_noise = torch.where(self > 0, torch.ones_like(self), sampled)
-    noise.copy_(effective_noise)
+def _fill_training_noise(noise, lower, upper):
+    # Generate directly into the caller-provided workspace. The training
+    # pointwise kernel then consumes this buffer and writes the effective noise
+    # back in the same launch as the output.
+    noise.uniform_(float(lower), float(upper))
 
 
 def _rrelu_with_noise_impl(
@@ -88,16 +101,22 @@ def _rrelu_with_noise_impl(
     upper=DEFAULT_UPPER,
     training=False,
     generator=None,
+    out=None,
 ):
     _check_rrelu_with_noise_args(self, noise, lower, upper, generator)
 
     if training:
-        _fill_training_noise(self, noise, lower, upper)
-        slope = noise
+        _fill_training_noise(noise, lower, upper)
+        if out is None:
+            output, _ = _rrelu_with_noise_train(self, noise, out1=noise)
+            return output
+        _rrelu_with_noise_train(self, noise, out0=out, out1=noise)
+        return out
     else:
-        slope = torch.full_like(self, (float(lower) + float(upper)) * 0.5)
-
-    return _rrelu_with_noise_forward(self, slope)
+        slope = (float(lower) + float(upper)) * 0.5
+        if out is None:
+            return _rrelu_with_noise_eval(self, slope)
+        return _rrelu_with_noise_eval(self, slope, out0=out)
 
 
 def rrelu_with_noise(
@@ -125,10 +144,9 @@ def rrelu_with_noise_(
 ):
     """FlagGems implementation of aten.rrelu_with_noise_."""
     logger.debug("GEMS RRELU_WITH_NOISE_")
-    output = _rrelu_with_noise_impl(
-        self, noise, lower, upper, training, generator
+    _rrelu_with_noise_impl(
+        self, noise, lower, upper, training, generator, out=self
     )
-    self.copy_(output)
     return self
 
 
