@@ -1423,6 +1423,8 @@ __all__ = [
     "round_",
     "round_out",
     "router_gemm",
+    "rrelu_with_noise",
+    "rrelu_with_noise_",
     "rrelu_with_noise_backward",
     "rrelu_with_noise_functional",
     "rsqrt",
