@@ -53,7 +53,7 @@ def _rrelu_with_noise_eval(self, slope):
     return tl.where(self > 0, self, self * slope)
 
 
-def _check_rrelu_with_noise_args(self, noise, lower, upper, generator):
+def _check_rrelu_with_noise_args(self, noise, lower, upper):
     if self.shape != noise.shape:
         raise RuntimeError(
             "noise tensor must have the same shape as self. "
@@ -83,15 +83,18 @@ def _check_rrelu_with_noise_args(self, noise, lower, upper, generator):
             f"Lower bound should be less than or equal to the upper bound, "
             f"got lower={lower} and upper={upper}"
         )
-    if generator is not None:
-        raise AssertionError("generator is not supported in FlagGems")
 
 
-def _fill_training_noise(noise, lower, upper):
-    # Generate directly into the caller-provided workspace. The training
-    # pointwise kernel then consumes this buffer and writes the effective noise
-    # back in the same launch as the output.
-    noise.uniform_(float(lower), float(upper))
+def _fill_training_noise(noise, lower, upper, generator):
+    # For a strided workspace, sample contiguously and let the training kernel
+    # scatter effective noise into the caller's layout while producing output.
+    if noise.is_contiguous():
+        noise.uniform_(float(lower), float(upper), generator=generator)
+        return noise
+
+    sampled = torch.empty_like(noise, memory_format=torch.contiguous_format)
+    sampled.uniform_(float(lower), float(upper), generator=generator)
+    return sampled
 
 
 def _rrelu_with_noise_impl(
@@ -103,14 +106,17 @@ def _rrelu_with_noise_impl(
     generator=None,
     out=None,
 ):
-    _check_rrelu_with_noise_args(self, noise, lower, upper, generator)
+    _check_rrelu_with_noise_args(self, noise, lower, upper)
+
+    if self.numel() == 0:
+        return torch.empty_like(self) if out is None else out
 
     if training:
-        _fill_training_noise(noise, lower, upper)
+        sampled_noise = _fill_training_noise(noise, lower, upper, generator)
         if out is None:
-            output, _ = _rrelu_with_noise_train(self, noise, out1=noise)
+            output, _ = _rrelu_with_noise_train(self, sampled_noise, out1=noise)
             return output
-        _rrelu_with_noise_train(self, noise, out0=out, out1=noise)
+        _rrelu_with_noise_train(self, sampled_noise, out0=out, out1=noise)
         return out
     else:
         slope = (float(lower) + float(upper)) * 0.5
@@ -129,9 +135,7 @@ def rrelu_with_noise(
 ):
     """FlagGems implementation of aten.rrelu_with_noise."""
     logger.debug("GEMS RRELU_WITH_NOISE")
-    return _rrelu_with_noise_impl(
-        self, noise, lower, upper, training, generator
-    )
+    return _rrelu_with_noise_impl(self, noise, lower, upper, training, generator)
 
 
 def rrelu_with_noise_(
@@ -144,9 +148,7 @@ def rrelu_with_noise_(
 ):
     """FlagGems implementation of aten.rrelu_with_noise_."""
     logger.debug("GEMS RRELU_WITH_NOISE_")
-    _rrelu_with_noise_impl(
-        self, noise, lower, upper, training, generator, out=self
-    )
+    _rrelu_with_noise_impl(self, noise, lower, upper, training, generator, out=self)
     return self
 
 
