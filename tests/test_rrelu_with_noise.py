@@ -35,8 +35,15 @@ def _run(op_name, self, noise, lower, upper, training, generator=None):
     return op(self, noise, lower, upper, training, generator)
 
 
+def _training_sample_mask(inp):
+    # torch_npu records a unit slope at signed zero, while the CPU/CUDA ATen
+    # implementation samples signed zero. Match the native reference selected
+    # by FlagGems on each platform.
+    return inp < 0 if flag_gems.vendor_name == "ascend" else inp <= 0
+
+
 def _assert_training_contract(result, original, noise, lower, upper):
-    sampled = original <= 0
+    sampled = _training_sample_mask(original)
     not_sampled = ~sampled
     lower_bound = torch.tensor(lower, dtype=noise.dtype, device=noise.device)
     upper_bound = torch.tensor(upper, dtype=noise.dtype, device=noise.device)
@@ -87,7 +94,7 @@ def test_rrelu_with_noise_training_random_contract(op_name, dtype):
     with flag_gems.use_gems():
         result = _run(op_name, inp, noise, lower, upper, True)
 
-    sampled = original <= 0
+    sampled = _training_sample_mask(original)
     _assert_training_contract(result, original, noise, lower, upper)
     sampled_noise = noise[sampled]
     assert torch.any(sampled_noise != sampled_noise[0])
@@ -177,8 +184,8 @@ def test_rrelu_with_noise_inplace_alias(training, dtype):
 
 @pytest.mark.parametrize("op_name", ["rrelu_with_noise", "rrelu_with_noise_"])
 def test_rrelu_with_noise_training_mask(op_name):
-    # The native training branch samples self <= 0. In particular, NaN takes
-    # the non-sampled path and must leave a recorded noise value of one.
+    # NaN takes the non-sampled path and records one. Signed-zero behavior is
+    # checked against the platform's native aten implementation.
     dtype = torch.float32
     lower = upper = 0.25
     values = [float("nan"), float("inf"), float("-inf"), 0.0, -0.0, 1.0, -1.0]
@@ -229,7 +236,7 @@ def test_rrelu_with_noise_non_contiguous(op_name, training, dtype):
 
     if training:
         _assert_training_contract(result, original, noise, lower, upper)
-        sampled_noise = noise[original <= 0]
+        sampled_noise = noise[_training_sample_mask(original)]
         assert torch.any(sampled_noise != sampled_noise[0])
     else:
         utils.gems_assert_close(result, ref_result, dtype)

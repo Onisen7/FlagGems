@@ -34,12 +34,26 @@ DEFAULT_UPPER = 0.3333333333333333
 )
 @triton.jit
 def _rrelu_with_noise_train(self, noise):
-    # ATen samples for self <= 0 (including signed zero), and records one for
-    # positive/NaN elements. Keeping this predicate aligned with backward is
-    # important because noise is the training-time gradient multiplier.
+    # PyTorch's CPU/CUDA path samples for self <= 0 (including signed zero)
+    # and records one for positive/NaN elements.
     not_positive = self <= 0
     effective_noise = tl.where(not_positive, noise, 1.0)
     output = tl.where(not_positive, self * effective_noise, self)
+    return output, effective_noise
+
+
+@pointwise_dynamic(
+    is_tensor=[True, True],
+    num_outputs=2,
+    promotion_methods=[(0, 1, "DEFAULT"), (0, 1, "DEFAULT")],
+)
+@triton.jit
+def _rrelu_with_noise_train_ascend(self, noise):
+    # torch_npu records a unit slope for both +0.0 and -0.0. Match the native
+    # Ascend aten reference without changing the CPU/CUDA zero-point behavior.
+    negative = self < 0
+    effective_noise = tl.where(negative, noise, 1.0)
+    output = tl.where(negative, self * effective_noise, self)
     return output, effective_noise
 
 
@@ -124,7 +138,7 @@ def _rrelu_with_noise_ascend_safe_impl(
         effective_noise = torch.empty_like(
             noise_work, memory_format=torch.contiguous_format
         )
-        result_flat, _ = _rrelu_with_noise_train(
+        result_flat, _ = _rrelu_with_noise_train_ascend(
             self_flat,
             sampled_noise.reshape(-1),
             out1=effective_noise.reshape(-1),
