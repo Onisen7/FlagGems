@@ -85,6 +85,7 @@ from .randperm import randperm
 from .repeat_interleave import repeat_interleave_self_int
 from .resolve_neg import resolve_neg
 from .rms_norm import rms_norm
+from .rrelu_with_noise import rrelu_with_noise, rrelu_with_noise_
 from .scatter import scatter, scatter_
 from .scatter_add_ import scatter_add_
 from .select_backward import select_backward
@@ -198,6 +199,8 @@ __all__ = [
     "repeat_interleave_self_int",
     "resolve_neg",
     "rms_norm",
+    "rrelu_with_noise",
+    "rrelu_with_noise_",
     "scatter",
     "scatter_",
     "scatter_add_",
