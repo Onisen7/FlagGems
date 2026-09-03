@@ -118,13 +118,18 @@ def _rrelu_with_noise_ascend_safe_impl(
             else torch.empty_like(noise, memory_format=torch.contiguous_format)
         )
         sampled_noise = _fill_training_noise(noise_work, lower, upper, generator)
+        # Keep the sampled input and effective-noise output disjoint. Ascend's
+        # pointwise compiler does not reliably preserve values when an input
+        # tensor is also supplied as a multi-output out1 buffer.
+        effective_noise = torch.empty_like(
+            noise_work, memory_format=torch.contiguous_format
+        )
         result_flat, _ = _rrelu_with_noise_train(
             self_flat,
             sampled_noise.reshape(-1),
-            out1=noise_work.reshape(-1),
+            out1=effective_noise.reshape(-1),
         )
-        if noise_work is not noise:
-            noise.copy_(noise_work)
+        noise.copy_(effective_noise.reshape(noise.shape))
     else:
         slope = (float(lower) + float(upper)) * 0.5
         result_flat = _rrelu_with_noise_eval(self_flat, slope)
