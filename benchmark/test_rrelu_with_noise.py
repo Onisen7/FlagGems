@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import Generator
 
 import pytest
@@ -24,9 +25,42 @@ from . import base, consts, utils
 
 DEFAULT_LOWER = 0.125
 DEFAULT_UPPER = 1.0 / 3.0
+ASCEND_MAX_BENCHMARK_NUMEL = 2**24
+
+
+def _limit_ascend_shapes(bench):
+    """Avoid the generic 2**30 pointwise shape on Ascend.
+
+    The common benchmark shape file contains a 1 Gi-element case intended to
+    stress CUDA pointwise kernels. Ascend's random ``uniform_`` lowering uses a
+    large local tile for that size and fails BiShengIR UB allocation during
+    compilation. This is a benchmark resource limit, not an operator shape
+    restriction; normal large workloads remain covered below the limit.
+    """
+    if flag_gems.vendor_name != "ascend":
+        return
+
+    bench.shapes = [
+        shape
+        for shape in bench.shapes
+        if math.prod(shape) <= ASCEND_MAX_BENCHMARK_NUMEL
+    ]
+    if not bench.shapes:
+        raise RuntimeError(
+            "No benchmark shape remains for Ascend after applying the "
+            f"{ASCEND_MAX_BENCHMARK_NUMEL}-element limit."
+        )
 
 
 class RreluWithNoiseBenchmark(base.UnaryPointwiseBenchmark):
+    def init_default_config(self):
+        super().init_default_config()
+        _limit_ascend_shapes(self)
+
+    def init_user_config(self):
+        super().init_user_config()
+        _limit_ascend_shapes(self)
+
     def get_input_iter(self, dtype: torch.dtype) -> Generator:
         for shape in self.shapes:
             inp = utils.generate_tensor_input(shape, dtype, self.device)
@@ -39,6 +73,14 @@ class RreluWithNoiseInplaceBenchmark(base.UnaryPointwiseBenchmark):
         super().__init__(*args, **kwargs)
         self._snapshot_key = None
         self._snapshot = None
+
+    def init_default_config(self):
+        super().init_default_config()
+        _limit_ascend_shapes(self)
+
+    def init_user_config(self):
+        super().init_user_config()
+        _limit_ascend_shapes(self)
 
     def get_latency(self, op, *args, **kwargs):
         # Benchmark.run measures the reference implementation first and then
