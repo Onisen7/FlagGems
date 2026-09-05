@@ -103,16 +103,26 @@ def _fill_training_noise(noise, lower, upper, generator, use_native_uniform=Fals
     # For a strided workspace, sample contiguously and let the training kernel
     # scatter effective noise into the caller's layout while producing output.
     def fill(tensor):
-        if use_native_uniform:
-            # Ascend's native ATen uniform_ is much faster than the generic
-            # Triton implementation. Keep this exclusion local to RReLU so
-            # the backend dispatch of other random operators is unchanged.
-            import flag_gems
-
-            with flag_gems.use_gems(exclude=["uniform_"]):
-                tensor.uniform_(float(lower), float(upper), generator=generator)
-        else:
+        if not use_native_uniform:
             tensor.uniform_(float(lower), float(upper), generator=generator)
+            return
+
+        # PyTorch 2.6 does not expose torch.library.get_kernel. Use a local
+        # exclusion to reach the native Ascend ATen uniform_ implementation.
+        # FlagGems 2.6 deletes current_work_registrar on context exit, so save
+        # and restore the outer registrar to keep nested use_gems valid.
+        import flag_gems
+
+        previous_registrar = getattr(flag_gems, "current_work_registrar", None)
+        try:
+            with flag_gems.use_gems(exclude=["uniform_"]):
+                tensor.uniform_(
+                    float(lower),
+                    float(upper),
+                    generator=generator,
+                )
+        finally:
+            flag_gems.current_work_registrar = previous_registrar
 
     if noise.is_contiguous():
         fill(noise)
