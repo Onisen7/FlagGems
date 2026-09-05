@@ -99,15 +99,27 @@ def _check_rrelu_with_noise_args(self, noise, lower, upper):
         )
 
 
-def _fill_training_noise(noise, lower, upper, generator):
+def _fill_training_noise(noise, lower, upper, generator, use_native_uniform=False):
     # For a strided workspace, sample contiguously and let the training kernel
     # scatter effective noise into the caller's layout while producing output.
+    def fill(tensor):
+        if use_native_uniform:
+            # Ascend's native ATen uniform_ is much faster than the generic
+            # Triton implementation. Keep this exclusion local to RReLU so
+            # the backend dispatch of other random operators is unchanged.
+            import flag_gems
+
+            with flag_gems.use_gems(exclude=["uniform_"]):
+                tensor.uniform_(float(lower), float(upper), generator=generator)
+        else:
+            tensor.uniform_(float(lower), float(upper), generator=generator)
+
     if noise.is_contiguous():
-        noise.uniform_(float(lower), float(upper), generator=generator)
+        fill(noise)
         return noise
 
     sampled = torch.empty_like(noise, memory_format=torch.contiguous_format)
-    sampled.uniform_(float(lower), float(upper), generator=generator)
+    fill(sampled)
     return sampled
 
 
@@ -131,7 +143,13 @@ def _rrelu_with_noise_ascend_safe_impl(
             if noise.is_contiguous()
             else torch.empty_like(noise, memory_format=torch.contiguous_format)
         )
-        sampled_noise = _fill_training_noise(noise_work, lower, upper, generator)
+        sampled_noise = _fill_training_noise(
+            noise_work,
+            lower,
+            upper,
+            generator,
+            use_native_uniform=True,
+        )
         # Keep the sampled input and effective-noise output disjoint. Ascend's
         # pointwise compiler does not reliably preserve values when an input
         # tensor is also supplied as a multi-output out1 buffer.
