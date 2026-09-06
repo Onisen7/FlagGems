@@ -295,10 +295,11 @@ def _impl(self, noise, lower, upper, training, generator, out):
         # evaluation branch is exactly LeakyReLU with the fixed midpoint slope:
         # x > 0 -> x, otherwise x * slope. Reuse that implementation instead
         # of launching a second fixed-configuration pointwise kernel.
-        if out is not None and self_work.data_ptr() == out.data_ptr():
-            result = torch.ops.aten.leaky_relu_.default(self_work, slope)
-        else:
-            result = torch.ops.aten.leaky_relu.default(self_work, slope)
+        # The Ascend leaky_relu_ implementation is not guaranteed to preserve
+        # input/output aliasing for every large shape. Use its autotuned
+        # non-inplace kernel and perform one explicit copy for rrelu_with_noise_
+        # so the result remains correct on all tested layouts.
+        result = torch.ops.aten.leaky_relu.default(self_work, slope)
 
     if out is None:
         return result
