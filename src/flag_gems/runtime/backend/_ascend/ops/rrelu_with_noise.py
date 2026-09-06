@@ -186,14 +186,61 @@ def _rrelu_with_noise_train_ascend(self, noise):
     return output, effective_noise
 
 
-@pointwise_dynamic(
-    is_tensor=[True, False],
-    num_outputs=1,
-    promotion_methods=[(0, 1, "DEFAULT")],
-)
-@triton.jit
-def _rrelu_with_noise_eval(self, slope):
-    return tl.where(self > 0, self, self * slope)
+@triton.jit(do_not_specialize=["N"])
+def _rrelu_with_noise_eval_kernel(
+    input_ptr,
+    output_ptr,
+    N,
+    slope,
+    UNROLL: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    n_workers = tl.num_programs(0)
+    pid = tl.program_id(0)
+    n_tasks = tl.cdiv(N, BLOCK * UNROLL)
+    tasks_per_worker = tl.cdiv(n_tasks, n_workers)
+
+    for task_index in range(tasks_per_worker):
+        task_id = pid + task_index * n_workers
+        start = task_id.to(tl.int64) * BLOCK * UNROLL
+        offsets = start + tl.arange(0, BLOCK)
+
+        off0 = offsets
+        off1 = offsets + BLOCK
+        off2 = offsets + BLOCK * 2
+        off3 = offsets + BLOCK * 3
+
+        x0 = tl.load(input_ptr + off0, mask=off0 < N)
+        x1 = tl.load(input_ptr + off1, mask=off1 < N)
+        x2 = tl.load(input_ptr + off2, mask=off2 < N)
+        x3 = tl.load(input_ptr + off3, mask=off3 < N)
+
+        y0 = tl.where(x0 > 0, x0, x0 * slope)
+        y1 = tl.where(x1 > 0, x1, x1 * slope)
+        y2 = tl.where(x2 > 0, x2, x2 * slope)
+        y3 = tl.where(x3 > 0, x3, x3 * slope)
+
+        tl.store(output_ptr + off0, y0, mask=off0 < N, eviction_policy="evict_first")
+        tl.store(output_ptr + off1, y1, mask=off1 < N, eviction_policy="evict_first")
+        tl.store(output_ptr + off2, y2, mask=off2 < N, eviction_policy="evict_first")
+        tl.store(output_ptr + off3, y3, mask=off3 < N, eviction_policy="evict_first")
+
+
+def _launch_eval(input_tensor, output_tensor, slope):
+    N = input_tensor.numel()
+    block = _uniform_block({"N": N})
+    num_warps = _uniform_num_warps({"N": N})
+    grid = (min(triton.cdiv(N, block * _UNROLL), 240),)
+    with torch_device_fn.device(input_tensor.device):
+        _rrelu_with_noise_eval_kernel[grid](
+            input_tensor,
+            output_tensor,
+            N,
+            slope,
+            _UNROLL,
+            BLOCK=block,
+            num_warps=num_warps,
+        )
 
 
 def _check_args(self, noise, lower, upper):
@@ -241,13 +288,24 @@ def _impl(self, noise, lower, upper, training, generator, out):
             out1=effective_noise.reshape(-1),
         )
         noise.copy_(effective_noise.reshape(noise_work.shape))
+        result = result_flat.reshape(self.shape)
     else:
         slope = (float(lower) + float(upper)) * 0.5
-        result_flat = _rrelu_with_noise_eval(self_flat, slope)
+        if out is not None:
+            # For a contiguous in-place input, the direct kernel aliases input
+            # and output safely because each element is independent.
+            result_work = self_work
+        else:
+            result_work = torch.empty_like(
+                self_work, memory_format=torch.contiguous_format
+            )
+        _launch_eval(self_flat, result_work.reshape(-1), slope)
+        result = result_work.reshape(self.shape)
 
-    result = result_flat.reshape(self.shape)
     if out is None:
         return result
+    if result.data_ptr() == out.data_ptr():
+        return out
     with torch.no_grad():
         out.copy_(result)
     return out
