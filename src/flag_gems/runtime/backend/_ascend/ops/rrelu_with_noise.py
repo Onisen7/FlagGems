@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Ascend implementation of aten.rrelu_with_noise and aten.rrelu_with_noise_."""
+
 import logging
 import math
 
@@ -19,27 +21,138 @@ import torch
 import triton
 import triton.language as tl
 
+from flag_gems.runtime import torch_device_fn
+from flag_gems.runtime.backend._ascend import heuristics_config_utils as _hcu
 from flag_gems.utils import pointwise_dynamic
+from flag_gems.utils.random_utils import philox_backend_seed_offset
+
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_LOWER = 0.125
 DEFAULT_UPPER = 0.3333333333333333
+_UNROLL = 4
+
+_PHILOX_SA = tl.constexpr(0xD2511F53)
+_PHILOX_SB = tl.constexpr(0xCD9E8D57)
+_PHILOX_KEY_A = tl.constexpr(0x9E3779B9)
+_PHILOX_KEY_B = tl.constexpr(0xBB67AE85)
 
 
-@pointwise_dynamic(
-    is_tensor=[True, True],
-    num_outputs=2,
-    promotion_methods=[(0, 1, "DEFAULT"), (0, 1, "DEFAULT")],
-)
 @triton.jit
-def _rrelu_with_noise_train(self, noise):
-    # PyTorch's CPU/CUDA path samples for self <= 0 (including signed zero)
-    # and records one for positive/NaN elements.
-    not_positive = self <= 0
-    effective_noise = tl.where(not_positive, noise, 1.0)
-    output = tl.where(not_positive, self * effective_noise, self)
-    return output, effective_noise
+def _mulhi_u32_limb(a, b):
+    a0 = a & 0xFFFF
+    a1 = (a >> 16) & 0xFFFF
+    b0 = b & 0xFFFF
+    b1 = (b >> 16) & 0xFFFF
+    w0 = a0 * b0
+    t = a1 * b0 + ((w0 >> 16) & 0xFFFF)
+    w1 = a0 * b1 + (t & 0xFFFF)
+    return a1 * b1 + ((t >> 16) & 0xFFFF) + ((w1 >> 16) & 0xFFFF)
+
+
+@triton.jit
+def _philox4x32_10(seed, c0, c1, c2, c3):
+    seed64 = seed.to(tl.uint64)
+    k0 = (seed64 & 0xFFFFFFFF).to(tl.uint32)
+    k1 = ((seed64 >> 32) & 0xFFFFFFFF).to(tl.uint32)
+    for _ in tl.static_range(10):
+        hi0 = _mulhi_u32_limb(c0, _PHILOX_SA)
+        lo0 = c0 * _PHILOX_SA
+        hi1 = _mulhi_u32_limb(c2, _PHILOX_SB)
+        lo1 = c2 * _PHILOX_SB
+        n0 = hi1 ^ c1 ^ k0
+        n1 = lo1
+        n2 = hi0 ^ c3 ^ k1
+        n3 = lo0
+        c0, c1, c2, c3 = n0, n1, n2, n3
+        k0 = k0 + _PHILOX_KEY_A
+        k1 = k1 + _PHILOX_KEY_B
+    return c0, c1, c2, c3
+
+
+@triton.jit
+def _uint32_to_uniform_float(r):
+    x = r.to(tl.int32, bitcast=True)
+    xa = x ^ (x >> 31)
+    return xa.to(tl.float32) * 4.6566127342e-10
+
+
+@triton.heuristics(_hcu.HEURISTICS_CONFIGS["exponential_"])
+@triton.jit(do_not_specialize=["philox_seed", "philox_offset", "N"])
+def _rrelu_uniform_kernel(
+    out_ptr,
+    N,
+    from_,
+    to,
+    philox_seed,
+    philox_offset,
+    UNROLL,
+    BLOCK: tl.constexpr,
+):
+    # Use the same worker/task decomposition as Ascend exponential.py. The
+    # manual Philox implementation is supported by the Ascend Triton backend,
+    # unlike tl.philox on some CANN releases.
+    n_workers = tl.num_programs(0)
+    pid = tl.program_id(0)
+    n_tasks = tl.cdiv(N, BLOCK * UNROLL)
+    tasks_per_worker = tl.cdiv(n_tasks, n_workers)
+
+    for task_index in range(tasks_per_worker):
+        task_id = pid + task_index * n_workers
+        seed64 = philox_seed.to(tl.int64)
+        offset64 = philox_offset.to(tl.int64)
+        c0 = (offset64 & 0xFFFFFFFF).to(tl.uint32)
+        c1 = ((offset64 >> 32) & 0xFFFFFFFF).to(tl.uint32)
+        i4 = task_id * BLOCK + tl.arange(0, BLOCK)
+        c0 += i4
+        zeros = c0 * 0
+        r0, r1, r2, r3 = _philox4x32_10(seed64, c0, c1, zeros, zeros)
+        scale = to - from_
+        r0 = _uint32_to_uniform_float(r0) * scale + from_
+        r1 = _uint32_to_uniform_float(r1) * scale + from_
+        r2 = _uint32_to_uniform_float(r2) * scale + from_
+        r3 = _uint32_to_uniform_float(r3) * scale + from_
+
+        start = task_id.to(tl.int64) * BLOCK * 4
+        off0 = start + tl.arange(0, BLOCK)
+        off1 = off0 + BLOCK
+        off2 = off1 + BLOCK
+        off3 = off2 + BLOCK
+        tl.store(out_ptr + off0, r0, mask=off0 < N, eviction_policy="evict_first")
+        tl.store(out_ptr + off1, r1, mask=off1 < N, eviction_policy="evict_first")
+        tl.store(out_ptr + off2, r2, mask=off2 < N, eviction_policy="evict_first")
+        tl.store(out_ptr + off3, r3, mask=off3 < N, eviction_policy="evict_first")
+
+
+def _rrelu_uniform_grid(N, meta):
+    grid = triton.cdiv(N, meta["BLOCK"] * _UNROLL)
+    return (min(grid, 240),)
+
+
+def _fill_training_noise(noise, lower, upper, generator=None):
+    """Fill a contiguous tensor with Ascend-supported Philox uniform values."""
+    N = noise.numel()
+    if N == 0:
+        return noise
+
+    # RReLU consumes one Philox 4-value block per four output elements, which
+    # preserves generator advancement and supports an explicit torch.Generator.
+    increment = triton.cdiv(N, _UNROLL)
+    philox_seed, philox_offset = philox_backend_seed_offset(
+        increment, generator=generator
+    )
+    with torch_device_fn.device(noise.device):
+        _rrelu_uniform_kernel[_rrelu_uniform_grid](
+            noise,
+            N,
+            float(lower),
+            float(upper),
+            philox_seed,
+            philox_offset,
+            _UNROLL,
+        )
+    return noise
 
 
 @pointwise_dynamic(
@@ -49,8 +162,7 @@ def _rrelu_with_noise_train(self, noise):
 )
 @triton.jit
 def _rrelu_with_noise_train_ascend(self, noise):
-    # torch_npu records a unit slope for both +0.0 and -0.0. Match the native
-    # Ascend aten reference without changing the CPU/CUDA zero-point behavior.
+    # torch_npu uses unit slope at both signed zeros; sample only x < 0.
     negative = self < 0
     effective_noise = tl.where(negative, noise, 1.0)
     output = tl.where(negative, self * effective_noise, self)
@@ -67,157 +179,61 @@ def _rrelu_with_noise_eval(self, slope):
     return tl.where(self > 0, self, self * slope)
 
 
-def _check_rrelu_with_noise_args(self, noise, lower, upper):
+def _check_args(self, noise, lower, upper):
     if self.shape != noise.shape:
-        raise RuntimeError(
-            "noise tensor must have the same shape as self. "
-            f"Got self.shape = {tuple(self.shape)} "
-            f"and noise.shape = {tuple(noise.shape)}"
-        )
+        raise RuntimeError("noise tensor must have the same shape as self")
     if self.device != noise.device:
-        raise RuntimeError(
-            f"self and noise must be on the same device, got "
-            f"{self.device} and {noise.device}"
-        )
+        raise RuntimeError("self and noise must be on the same device")
     if self.dtype != noise.dtype:
-        raise RuntimeError(
-            f"self and noise must have the same dtype, got "
-            f"{self.dtype} and {noise.dtype}"
-        )
+        raise RuntimeError("self and noise must have the same dtype")
     if not self.is_floating_point():
-        raise RuntimeError(
-            f"rrelu_with_noise is not implemented for dtype {self.dtype}"
-        )
-    if not math.isfinite(float(lower)):
-        raise RuntimeError(f"rrelu: lower bound must be finite, got {lower}")
-    if not math.isfinite(float(upper)):
-        raise RuntimeError(f"rrelu: upper bound must be finite, got {upper}")
+        raise RuntimeError(f"rrelu_with_noise is not implemented for {self.dtype}")
+    if not math.isfinite(float(lower)) or not math.isfinite(float(upper)):
+        raise RuntimeError("rrelu bounds must be finite")
     if float(lower) > float(upper):
         raise RuntimeError(
-            f"Lower bound should be less than or equal to the upper bound, "
-            f"got lower={lower} and upper={upper}"
+            f"Lower bound should be less than or equal to upper bound, "
+            f"got lower={lower}, upper={upper}"
         )
 
 
-def _fill_training_noise(noise, lower, upper, generator, use_native_uniform=False):
-    # For a strided workspace, sample contiguously and let the training kernel
-    # scatter effective noise into the caller's layout while producing output.
-    def fill(tensor):
-        if not use_native_uniform:
-            tensor.uniform_(float(lower), float(upper), generator=generator)
-            return
+def _impl(self, noise, lower, upper, training, generator, out):
+    _check_args(self, noise, lower, upper)
+    if self.numel() == 0:
+        return self if out is not None else torch.empty_like(self)
 
-        # PyTorch 2.6 does not expose torch.library.get_kernel. Use a local
-        # exclusion to reach the native Ascend ATen uniform_ implementation.
-        # FlagGems 2.6 deletes current_work_registrar on context exit, so save
-        # and restore the outer registrar to keep nested use_gems valid.
-        import flag_gems
-
-        previous_registrar = getattr(flag_gems, "current_work_registrar", None)
-        try:
-            with flag_gems.use_gems(exclude=["uniform_"]):
-                tensor.uniform_(
-                    float(lower),
-                    float(upper),
-                    generator=generator,
-                )
-        finally:
-            flag_gems.current_work_registrar = previous_registrar
-
-    if noise.is_contiguous():
-        fill(noise)
-        return noise
-
-    sampled = torch.empty_like(noise, memory_format=torch.contiguous_format)
-    fill(sampled)
-    return sampled
-
-
-def _is_ascend_device(tensor):
-    # Ascend's Triton backend does not reliably support a pointwise output
-    # aliasing an input or arbitrary-rank strided output. Keep this fallback
-    # local to private-use backends so CUDA and other vendors retain the
-    # direct out0/out1 path.
-    return tensor.device.type in ("npu", "privateuseone")
-
-
-def _rrelu_with_noise_ascend_safe_impl(
-    self, noise, lower, upper, training, generator, out
-):
     self_work = self if self.is_contiguous() else self.contiguous()
     self_flat = self_work.reshape(-1)
 
     if training:
-        noise_work = (
-            noise
-            if noise.is_contiguous()
-            else torch.empty_like(noise, memory_format=torch.contiguous_format)
-        )
-        sampled_noise = _fill_training_noise(
-            noise_work,
-            lower,
-            upper,
-            generator,
-            use_native_uniform=True,
-        )
-        # Keep the sampled input and effective-noise output disjoint. Ascend's
-        # pointwise compiler does not reliably preserve values when an input
-        # tensor is also supplied as a multi-output out1 buffer.
+        noise_work = noise
+        if not noise_work.is_contiguous():
+            noise_work = torch.empty_like(
+                noise_work, memory_format=torch.contiguous_format
+            )
+        _fill_training_noise(noise_work, lower, upper, generator)
+
+        # Keep the sampled input and effective-noise output disjoint because
+        # Ascend pointwise multi-output aliasing is not reliable on all CANNs.
         effective_noise = torch.empty_like(
             noise_work, memory_format=torch.contiguous_format
         )
         result_flat, _ = _rrelu_with_noise_train_ascend(
             self_flat,
-            sampled_noise.reshape(-1),
+            noise_work.reshape(-1),
             out1=effective_noise.reshape(-1),
         )
-        noise.copy_(effective_noise.reshape(noise.shape))
+        noise.copy_(effective_noise.reshape(noise_work.shape))
     else:
         slope = (float(lower) + float(upper)) * 0.5
         result_flat = _rrelu_with_noise_eval(self_flat, slope)
 
     result = result_flat.reshape(self.shape)
-    if out is not None:
-        # Avoid out0=self aliasing in the Ascend-generated pointwise kernel.
-        # no_grad prevents an internal copy_ from adding CopyBackwards to the
-        # user-visible autograd graph; the enclosing aten op owns autograd.
-        with torch.no_grad():
-            out.copy_(result)
-        return out
-    return result
-
-
-def _rrelu_with_noise_impl(
-    self,
-    noise,
-    lower=DEFAULT_LOWER,
-    upper=DEFAULT_UPPER,
-    training=False,
-    generator=None,
-    out=None,
-):
-    _check_rrelu_with_noise_args(self, noise, lower, upper)
-
-    if self.numel() == 0:
-        return torch.empty_like(self) if out is None else out
-
-    if _is_ascend_device(self):
-        return _rrelu_with_noise_ascend_safe_impl(
-            self, noise, lower, upper, training, generator, out
-        )
-
-    if training:
-        sampled_noise = _fill_training_noise(noise, lower, upper, generator)
-        if out is None:
-            output, _ = _rrelu_with_noise_train(self, sampled_noise, out1=noise)
-            return output
-        _rrelu_with_noise_train(self, sampled_noise, out0=out, out1=noise)
-        return out
-    else:
-        slope = (float(lower) + float(upper)) * 0.5
-        if out is None:
-            return _rrelu_with_noise_eval(self, slope)
-        return _rrelu_with_noise_eval(self, slope, out0=out)
+    if out is None:
+        return result
+    with torch.no_grad():
+        out.copy_(result)
+    return out
 
 
 def rrelu_with_noise(
@@ -228,9 +244,8 @@ def rrelu_with_noise(
     training=False,
     generator=None,
 ):
-    """FlagGems implementation of aten.rrelu_with_noise."""
-    logger.debug("GEMS RRELU_WITH_NOISE")
-    return _rrelu_with_noise_impl(self, noise, lower, upper, training, generator)
+    logger.debug("GEMS ASCEND RRELU_WITH_NOISE")
+    return _impl(self, noise, lower, upper, training, generator, None)
 
 
 def rrelu_with_noise_(
@@ -241,9 +256,8 @@ def rrelu_with_noise_(
     training=False,
     generator=None,
 ):
-    """FlagGems implementation of aten.rrelu_with_noise_."""
-    logger.debug("GEMS RRELU_WITH_NOISE_")
-    _rrelu_with_noise_impl(self, noise, lower, upper, training, generator, out=self)
+    logger.debug("GEMS ASCEND RRELU_WITH_NOISE_")
+    _impl(self, noise, lower, upper, training, generator, self)
     return self
 
 
