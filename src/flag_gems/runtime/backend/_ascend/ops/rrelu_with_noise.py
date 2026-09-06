@@ -47,11 +47,6 @@ def _uniform_num_warps(args):
     return 16
 
 
-_UNIFORM_HEURISTICS = {
-    "BLOCK": _uniform_block,
-    "num_warps": _uniform_num_warps,
-}
-
 _PHILOX_SA = tl.constexpr(0xD2511F53)
 _PHILOX_SB = tl.constexpr(0xCD9E8D57)
 _PHILOX_KEY_A = tl.constexpr(0x9E3779B9)
@@ -97,7 +92,6 @@ def _uint32_to_uniform_float(r):
     return xa.to(tl.float32) * 4.6566127342e-10
 
 
-@triton.heuristics(_UNIFORM_HEURISTICS)
 @triton.jit(do_not_specialize=["philox_seed", "philox_offset", "N"])
 def _rrelu_uniform_kernel(
     out_ptr,
@@ -156,9 +150,11 @@ def _fill_training_noise(noise, lower, upper, generator=None):
     philox_seed, philox_offset = philox_backend_seed_offset(
         increment, generator=generator
     )
+    block = _uniform_block({"N": N})
+    num_warps = _uniform_num_warps({"N": N})
 
     def grid_fn(meta):
-        grid = triton.cdiv(N, meta["BLOCK"] * _UNROLL)
+        grid = triton.cdiv(N, block * _UNROLL)
         return (min(grid, 240),)
 
     with torch_device_fn.device(noise.device):
@@ -170,6 +166,8 @@ def _fill_training_noise(noise, lower, upper, generator=None):
             philox_seed,
             philox_offset,
             _UNROLL,
+            BLOCK=block,
+            num_warps=num_warps,
         )
     return noise
 
