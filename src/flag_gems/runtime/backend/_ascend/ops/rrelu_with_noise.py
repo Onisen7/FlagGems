@@ -291,16 +291,14 @@ def _impl(self, noise, lower, upper, training, generator, out):
         result = result_flat.reshape(self.shape)
     else:
         slope = (float(lower) + float(upper)) * 0.5
-        if out is not None:
-            # For a contiguous in-place input, the direct kernel aliases input
-            # and output safely because each element is independent.
-            result_work = self_work
+        # Ascend already has an autotuned LeakyReLU implementation. RReLU's
+        # evaluation branch is exactly LeakyReLU with the fixed midpoint slope:
+        # x > 0 -> x, otherwise x * slope. Reuse that implementation instead
+        # of launching a second fixed-configuration pointwise kernel.
+        if out is not None and self_work.data_ptr() == out.data_ptr():
+            result = torch.ops.aten.leaky_relu_.default(self_work, slope)
         else:
-            result_work = torch.empty_like(
-                self_work, memory_format=torch.contiguous_format
-            )
-        _launch_eval(self_flat, result_work.reshape(-1), slope)
-        result = result_work.reshape(self.shape)
+            result = torch.ops.aten.leaky_relu.default(self_work, slope)
 
     if out is None:
         return result
