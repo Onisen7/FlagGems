@@ -125,11 +125,6 @@ def _rrelu_uniform_kernel(
         tl.store(out_ptr + off3, r3, mask=off3 < N, eviction_policy="evict_first")
 
 
-def _rrelu_uniform_grid(N, meta):
-    grid = triton.cdiv(N, meta["BLOCK"] * _UNROLL)
-    return (min(grid, 240),)
-
-
 def _fill_training_noise(noise, lower, upper, generator=None):
     """Fill a contiguous tensor with Ascend-supported Philox uniform values."""
     N = noise.numel()
@@ -142,8 +137,13 @@ def _fill_training_noise(noise, lower, upper, generator=None):
     philox_seed, philox_offset = philox_backend_seed_offset(
         increment, generator=generator
     )
+
+    def grid_fn(meta):
+        grid = triton.cdiv(N, meta["BLOCK"] * _UNROLL)
+        return (min(grid, 240),)
+
     with torch_device_fn.device(noise.device):
-        _rrelu_uniform_kernel[_rrelu_uniform_grid](
+        _rrelu_uniform_kernel[grid_fn](
             noise,
             N,
             float(lower),
