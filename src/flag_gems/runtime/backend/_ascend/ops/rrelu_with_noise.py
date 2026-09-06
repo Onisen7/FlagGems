@@ -22,7 +22,6 @@ import triton
 import triton.language as tl
 
 from flag_gems.runtime import torch_device_fn
-from flag_gems.runtime.backend._ascend import heuristics_config_utils as _hcu
 from flag_gems.utils import pointwise_dynamic
 from flag_gems.utils.random_utils import philox_backend_seed_offset
 
@@ -32,6 +31,26 @@ logger = logging.getLogger(__name__)
 DEFAULT_LOWER = 0.125
 DEFAULT_UPPER = 0.3333333333333333
 _UNROLL = 4
+
+
+def _uniform_block(args):
+    # Keep the same conservative choices as Ascend exponential.py without
+    # importing the backend heuristic module at import/decorator time.
+    return 512 if args["N"] <= 512 else 1024
+
+
+def _uniform_num_warps(args):
+    if args["N"] <= 512:
+        return 4
+    if args["N"] <= 1024:
+        return 8
+    return 16
+
+
+_UNIFORM_HEURISTICS = {
+    "BLOCK": _uniform_block,
+    "num_warps": _uniform_num_warps,
+}
 
 _PHILOX_SA = tl.constexpr(0xD2511F53)
 _PHILOX_SB = tl.constexpr(0xCD9E8D57)
@@ -78,7 +97,7 @@ def _uint32_to_uniform_float(r):
     return xa.to(tl.float32) * 4.6566127342e-10
 
 
-@triton.heuristics(_hcu.HEURISTICS_CONFIGS["exponential_"])
+@triton.heuristics(_UNIFORM_HEURISTICS)
 @triton.jit(do_not_specialize=["philox_seed", "philox_offset", "N"])
 def _rrelu_uniform_kernel(
     out_ptr,
