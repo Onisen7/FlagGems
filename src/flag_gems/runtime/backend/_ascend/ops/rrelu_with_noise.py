@@ -24,6 +24,7 @@ import triton.language as tl
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import pointwise_dynamic
 from flag_gems.utils.random_utils import philox_backend_seed_offset
+from flag_gems.ops.leaky_relu import leaky_relu_out as _gems_leaky_relu_out
 
 
 logger = logging.getLogger(__name__)
@@ -291,16 +292,16 @@ def _impl(self, noise, lower, upper, training, generator, out):
         result = result_flat.reshape(self.shape)
     else:
         slope = (float(lower) + float(upper)) * 0.5
-        # Ascend already has an autotuned LeakyReLU implementation. RReLU's
-        # evaluation branch is exactly LeakyReLU with the fixed midpoint slope:
-        # x > 0 -> x, otherwise x * slope. Reuse that implementation instead
-        # of launching a second fixed-configuration pointwise kernel.
-        # The Ascend leaky_relu_ implementation is not guaranteed to preserve
-        # input/output aliasing for every large shape. Use its autotuned
-        # non-inplace kernel and perform one explicit copy for rrelu_with_noise_
-        # so the result remains correct on all tested layouts.
-        result = torch.ops.aten.leaky_relu.default(self_work, slope)
 
+    # Eval RReLU is equivalent to LeakyReLU with a fixed midpoint slope.
+    # Use the direct FlagGems out implementation to avoid an extra aten
+    # dispatch layer while preserving a separate output buffer.
+        result = torch.empty_like(self_work)
+        _gems_leaky_relu_out(
+            self_work,
+            slope,
+            out=result,
+        )
     if out is None:
         return result
     if result.data_ptr() == out.data_ptr():
