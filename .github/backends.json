@@ -1,12 +1,5 @@
 [
   {
-    "backend": "ascend-cann850",
-    "runner_label": "cann850",
-    "label": "vendor/Ascend",
-    "gpu_check": "tools/gpu_check_ascend.sh",
-    "enabled": true
-  },
-  {
     "backend": "ascend-cann900",
     "runner_label": "cann9",
     "label": "vendor/Ascend",
@@ -49,15 +42,22 @@
     "enabled": true
   },
   {
+    "backend": "metax-maca3720",
+    "runner_label": "maca372",
+    "label": "vendor/MetaX",
+    "gpu_check": "tools/gpu_check_metax.sh",
+    "enabled": true
+  },
+  {
     "backend": "metax-maca3810",
-    "runner_label": "metax",
+    "runner_label": "maca381",
     "label": "vendor/MetaX",
     "gpu_check": "tools/gpu_check_metax.sh",
     "enabled": true
   },
   {
     "backend": "mthreads-musa520",
-    "runner_label": "mthreads",
+    "runner_label": "musa-520",
     "label": "vendor/MooreThreads",
     "gpu_check": "tools/gpu_check_mthreads.sh",
     "enabled": true
