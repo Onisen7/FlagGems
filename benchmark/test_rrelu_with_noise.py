@@ -22,7 +22,6 @@ import flag_gems
 
 from . import base, consts, utils
 
-
 DEFAULT_LOWER = 0.125
 DEFAULT_UPPER = 1.0 / 3.0
 ASCEND_MAX_BENCHMARK_NUMEL = 2**24

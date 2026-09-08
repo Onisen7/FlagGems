@@ -19,7 +19,6 @@ import flag_gems
 
 from . import accuracy_utils as utils
 
-
 DEFAULT_LOWER = 0.125
 DEFAULT_UPPER = 1.0 / 3.0
 
